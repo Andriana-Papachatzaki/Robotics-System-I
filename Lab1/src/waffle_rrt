@@ -1,0 +1,467 @@
+import time
+import math
+import random
+import numpy as np
+import mujoco
+import mujoco.viewer
+from create_maze import generate_maze, plot_maze, export_data_to_mujoco_xmls, get_entrance_exits_xy, get_bounds_xy, view_mujoco_scene
+
+
+def wrap_to_pi(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+def yaw_to_quat(yaw: float) -> np.ndarray:
+    return np.array([math.cos(yaw * 0.5), 0., 0., math.sin(yaw * 0.5)], dtype = float)
+
+def build_base_subtree_body_mask(model: mujoco.MjModel, base_body_name="base") -> np.ndarray:
+    # Returns boolean mask over bodies
+    base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, base_body_name)
+    if base_id < 0:
+        raise RuntimeError("Could not find base body.")
+
+    in_subtree = np.zeros(model.nbody, dtype = bool)
+
+    for b in range(1, model.nbody):
+        cur = b
+        while cur != -1:
+            if cur == base_id:
+                in_subtree[b] = True
+                break
+            cur = model.body_parentid[cur]
+
+    return in_subtree
+
+def in_contact(model: mujoco.MjModel,
+               data: mujoco.MjData,
+               robot_body_in_subtree: np.ndarray,
+               floor_geom_id: int | None = None) -> bool:
+    """
+    Returns True if robot collides with ANY obstacle geom.
+    """
+
+    for k in range(data.ncon):
+        ##### ENTER CODE HERE #####
+        c = data.contact[k]
+        ###########################
+        g1 = c.geom1
+        g2 = c.geom2
+
+        # Ignore floor contacts
+        if floor_geom_id is not None and (g1 == floor_geom_id or g2 == floor_geom_id):
+            continue
+
+        b1 = model.geom_bodyid[g1]
+        b2 = model.geom_bodyid[g2]
+
+        # Check robot vs non-robot collision
+        ##### ENTER CODE HERE #####
+        if (robot_body_in_subtree[b1] and not robot_body_in_subtree[b2]):
+           return True
+        elif(robot_body_in_subtree[b2] and not robot_body_in_subtree[b1]):
+            return True
+        ###########################
+
+    return False
+
+def connect(model,
+            data,
+            qpos_template,
+            x_from,
+            x_to,
+            robot_body_in_subtree,
+            floor_geom_id,
+            step_m = 0.1):
+    """
+    Discretize the tree edge in SE(2) and use Mujoco contacts to test for collision
+    """
+
+    p0 = x_from[:2]
+    p1 = x_to[:2]
+
+    seg = p1 - p0
+    length = float(np.linalg.norm(seg))
+
+    if length < 1e-9:
+        n = 2
+    else:
+        n = max(2, int(math.ceil(length / step_m)) + 1)
+
+    th0 = float(x_from[2])
+    th1 = float(x_to[2])
+    dth = wrap_to_pi(th1 - th0)
+
+    for i in range(n):
+        t = i / (n - 1)
+
+        x = float(p0[0] + t * seg[0])
+        y = float(p0[1] + t * seg[1])
+        th = wrap_to_pi(th0 + t * dth)
+
+        # Reset qpos to a template so wheels etc remain sane
+        data.qpos[:] = qpos_template
+
+        data.qpos[0] = x
+        data.qpos[1] = y
+        data.qpos[2] = qpos_template[2]
+        data.qpos[3:7] = yaw_to_quat(th)
+
+        ##### ENTER CODE HERE #####
+        fk = mujoco.mj_forward(model, data)
+        ###########################
+
+        if in_contact(model, data, robot_body_in_subtree, floor_geom_id):
+            return False
+
+    return True
+
+def quat_to_yaw(qw, qx, qy, qz) -> float:
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+class RRTNode:
+    __slots__ = ("x", "parent")
+    def __init__(self, x: np.ndarray, parent: int):
+        self.x = x
+        self.parent = parent
+
+
+def rrt_plan_se2(
+    model: mujoco.MjModel,
+    x_start: np.ndarray,
+    x_goal: np.ndarray,
+    total_bounds_xy: np.ndarray,
+    maze_bounds_xy: np.ndarray,
+    hall_bounds_xy: np.ndarray,
+    step_size: float = 0.1,
+    goal_radius_xy: float = 0.1,
+    goal_radius_theta: float = 0.1,
+    max_iters: int = 20000,
+    w_theta: float = 0.2,
+    maze_sample_rate = 0.8,
+    goal_sample_rate = 0.05,
+    rng: np.random.Generator | None = None
+):
+    total_bounds_xy = np.array(total_bounds_xy)
+    maze_bounds_xy = np.array(maze_bounds_xy)
+    hall_bounds_xy = np.array(hall_bounds_xy)
+    if rng is None:
+        rng = np.random.default_rng(seed=None)
+
+    nodes = [RRTNode(x_start.copy(), parent=-1)]
+
+    # Separate data for collision checking
+    data_check = mujoco.MjData(model)
+
+    floor_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    if floor_geom_id < 0:
+        floor_geom_id = None
+
+    robot_body_in_subtree = build_base_subtree_body_mask(model, base_body_name="base")
+
+    qpos_template = data_check.qpos.copy()
+    mujoco.mj_forward(model, data_check)
+
+    def sample_state(maze_sample_rate, goal_sample_rate):
+        if rng.uniform() < goal_sample_rate:
+            return x_goal.copy()
+        # bounds = total_bounds_xy
+        if rng.uniform() < maze_sample_rate:
+            bounds = maze_bounds_xy
+        else:
+            bounds = hall_bounds_xy
+        ##### ENTER CODE HERE #####
+        x = rng.uniform(bounds[0, 0], bounds[0, 1])
+        y = rng.uniform(bounds[1, 0], bounds[1, 1])
+        th = rng.uniform(-np.pi, np.pi)
+        ###########################
+        return np.array([x, y, th], dtype = float)
+
+    def nearest_index(x_sample):
+        xs = np.stack([n.x for n in nodes], axis=0)  # (N,3)
+        ##### ENTER CODE HERE #####
+        dx = np.array([xs[0:,0] - x_sample[0]])
+        dy = np.array([xs[0:,1] - x_sample[1]])
+        ###########################
+        dth = np.array([wrap_to_pi(t - x_sample[2]) for t in xs[:, 2]])
+        d2 = dx*dx + dy*dy + w_theta * (dth*dth)
+        return int(np.argmin(d2))
+
+    def steer(x_near, x_sample):
+        # Move a fixed step in the XY direction toward sample
+        dx = x_sample[0] - x_near[0]
+        dy = x_sample[1] - x_near[1]
+        dist = math.hypot(dx, dy)
+
+        if dist < 1e-9:
+            # no translation; just rotate a bit toward sample theta
+            th_new = x_near[2] + clamp(wrap_to_pi(x_sample[2] - x_near[2]), -0.5, 0.5)
+            return np.array([x_near[0], x_near[1], wrap_to_pi(th_new)], dtype = float)
+
+        ux = dx / dist
+        uy = dy / dist
+        ##### ENTER CODE HERE #####
+        x_new = x_near[0] + step_size * ux
+        y_new = x_near[1] + step_size * uy
+        ###########################
+        # clamp within bounds
+        x_new = clamp(x_new, total_bounds_xy[0, 0], total_bounds_xy[0, 1])
+        y_new = clamp(y_new, total_bounds_xy[1, 0], total_bounds_xy[1, 1])
+
+        th_new = math.atan2(uy, ux)
+        return np.array([x_new, y_new, th_new], dtype = float)
+
+    goal_node_idx = None
+
+    for iter in range(max_iters):
+        ##### ENTER CODE HERE #####
+        x_sample = sample_state(maze_sample_rate, goal_sample_rate)
+        i_near = nearest_index(x_sample)
+        x_near = nodes[i_near].x.copy()
+        x_new = steer(x_near, x_sample)
+        
+        ###########################
+
+        success = connect(
+            model=model,
+            data=data_check,
+            qpos_template=qpos_template,
+            x_from=x_near,
+            x_to=x_new,
+            robot_body_in_subtree=robot_body_in_subtree,
+            floor_geom_id=floor_geom_id,
+            step_m=0.01
+        )
+
+        if (iter % 100 == 0):
+            print(f"Iteration: {iter} ,  RRT tree length: {len(nodes)}")
+
+        if success:
+            nodes.append(RRTNode(x_new, parent=i_near))
+            i_new = len(nodes) - 1
+
+            in_goal_xy = np.linalg.norm(x_new[0:2] - x_goal[0:2]) <= goal_radius_xy
+            in_goal_th = abs(wrap_to_pi(x_new[2] - x_goal[2])) <= goal_radius_theta
+            if in_goal_xy and in_goal_th:
+                print(f"Break at iteration: {iter} with distance {np.linalg.norm(x_new[0:2] - x_goal[0:2])} and angle distance {abs(wrap_to_pi(x_new[2] - x_goal[2]))}")
+                goal_node_idx = i_new
+                break
+
+    if goal_node_idx is None:
+        return None, np.stack([n.x for n in nodes], axis = 0), np.array([n.parent for n in nodes], dtype = int)
+
+    # Backtrack path
+    rrt_path = []
+    idx = goal_node_idx
+    while idx != -1:
+        rrt_path.append(nodes[idx].x.copy())
+        idx = nodes[idx].parent
+    rrt_path.reverse()
+    rrt_path = np.array(rrt_path)
+    rrt_nodes = np.stack([n.x for n in nodes], axis = 0)
+    rrt_parents = np.array([n.parent for n in nodes], dtype = int)
+
+    return rrt_path, rrt_nodes, rrt_parents
+
+
+def follow_waypoints_se2(model, data, viewer, waypoints: np.ndarray):
+    act_left = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "wheel_left")
+    act_right = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "wheel_right")
+    if act_left < 0 or act_right < 0:
+        raise RuntimeError("Could not find actuators wheel_left / wheel_right.")
+
+    L = 0.288
+    r = 0.033
+    W_MIN, W_MAX = -7.88, 7.88
+
+    # gains
+    Kp_dist = 1.0
+    Kp_yaw_pos = 3.0
+    Kp_yaw_final = 4.0
+
+    v_max = 5.
+    omega_max = 2.5
+
+    wp_tol = 0.15
+    final_xy_tol = 0.10
+    final_th_tol = 0.12
+
+    ##### ENTER CODE HERE #####
+    dt = model.opt.timestep
+    ###########################
+    mujoco.mj_forward(model, data)
+
+    wp_i = 0
+
+    while viewer.is_running():
+        ##### ENTER CODE HERE #####
+        x = data.qpos[0]
+        y = data.qpos[1]
+        yaw = quat_to_yaw(data.qpos[3], data.qpos[4], data.qpos[5],data.qpos[6])
+        ###########################
+
+        target = waypoints[wp_i]
+        tx, ty, tth = float(target[0]), float(target[1]), float(target[2])
+
+        dx, dy = tx - x, ty - y
+        dist = math.hypot(dx, dy)
+
+        # advance waypoint
+        if wp_i < len(waypoints) - 1 and dist < wp_tol:
+            wp_i += 1
+            continue
+
+        # final stopping condition
+        if wp_i == len(waypoints) - 1:
+            eyaw_final = wrap_to_pi(tth - yaw)
+            if dist < final_xy_tol and abs(eyaw_final) < final_th_tol:
+                data.ctrl[act_left] = 0.0
+                data.ctrl[act_right] = 0.0
+                mujoco.mj_step(model, data)
+                viewer.sync()
+                time.sleep(dt)
+                continue
+
+        yaw_des = math.atan2(dy, dx) if dist > 1e-6 else tth
+        eyaw = wrap_to_pi(yaw_des - yaw)
+
+        v = clamp(Kp_dist * dist, 0.0, v_max)
+        if wp_i == len(waypoints) - 1 and dist < 0.4:
+            v *= 0.5
+
+        if wp_i == len(waypoints) - 1 and dist < 0.15:
+            eyaw_final = wrap_to_pi(tth - yaw)
+            omega = clamp(Kp_yaw_final * eyaw_final, -omega_max, omega_max)
+            v = min(v, 0.08)  # creep while aligning
+        else:
+            omega = clamp(Kp_yaw_pos * eyaw, -omega_max, omega_max)
+
+        ##### ENTER CODE HERE #####
+        wleft = (v/r)-((L*omega)/(2*r))
+        wright = (v/r)+((L*omega)/(2*r))
+        ###########################
+
+        ##### ENTER CODE HERE #####
+        wleftclamp = clamp(wleft, W_MIN, W_MAX)
+        wrightclamp = clamp(wright, W_MIN, W_MAX)
+        ###########################
+
+        ##### ENTER CODE HERE #####
+        data.ctrl[act_left] = wleftclamp
+        data.ctrl[act_right] = wrightclamp
+        mujoco.mj_step(model, data)
+        ###########################
+        viewer.sync()
+        time.sleep(dt)
+
+
+def main():
+
+    # Generate Maze
+
+    # ----------------------------------------
+    # EXPERIMENT WITH PARAMETERS VALUES
+    rows = 10
+    cols = 10
+    horizontal_prob = 0.7
+    vertical_prob = 1.0 - horizontal_prob
+    exits = 1
+    robot_size = 0.3
+    walls_safety_margin = robot_size
+    wall_thickness = 0.05
+    wall_height = 0.2
+    rgba = [0.7, 0.5, 0.7, 1.0]
+    rng_seed = None
+    # ----------------------------------------
+
+    cell_size = max(robot_size + 0.1, robot_size + walls_safety_margin) + wall_thickness
+    added_size = max(0.0, min(4.0 * wall_thickness, walls_safety_margin / 2))
+    wall_thickness_augm = wall_thickness + added_size
+    x_translation = -cols / 2 * cell_size
+    y_translation = wall_thickness / 2 + robot_size
+    z_rotation = -np.pi/2
+    hall_width = 2 * y_translation
+    rng = random.Random(x = rng_seed)
+    only_maze_real_xml = "robotis_tb3/scene_maze_real.xml"
+    bot_maze_real_xml = "robotis_tb3/scene_turtlebot3_waffle_pi_maze_real.xml"
+    only_maze_RRT_xml = "robotis_tb3/scene_maze_RRT.xml"
+    bot_maze_RRT_xml = "robotis_tb3/scene_turtlebot3_waffle_pi_maze_RRT.xml"
+    only_maze_combined_xml = "robotis_tb3/scene_maze_combined.xml"
+    bot_maze_combined_xml = "robotis_tb3/scene_turtlebot3_waffle_pi_maze_combined.xml"
+
+    horizontal, vertical = generate_maze(rows, cols, exits, rng, PN = vertical_prob / 2, PS = vertical_prob / 2, PW = horizontal_prob / 2, PE = horizontal_prob / 2)
+    entrance_xy, exits_xy = get_entrance_exits_xy(horizontal, rows, cols, cell_size, x_translation, y_translation, z_rotation)
+    total_bounds_xy, maze_bounds_xy, hall_bounds_xy = get_bounds_xy(rows, cols, cell_size, x_translation, y_translation, z_rotation, hall_width)
+
+    plot_maze(horizontal, vertical, rows, cols, cell_size, 0.0, 0.0, 0.0, None, False, None)
+
+    export_data_to_mujoco_xmls(
+        horizontal, vertical, rows, cols, x_translation, y_translation, z_rotation,
+        cell_size, wall_thickness, wall_thickness_augm, wall_height, hall_width, rgba,
+        only_maze_real_xml, bot_maze_real_xml, only_maze_RRT_xml, bot_maze_RRT_xml, only_maze_combined_xml, bot_maze_combined_xml
+    )  # exporting all xml files
+
+    print(f"\nHorizontal walls:\n {np.flipud(np.array(horizontal)).astype(int)}")
+    print(f"Vertical walls:\n {np.flipud(np.array(vertical)).astype(int)}")
+    print(f"Maze entrance at position (x, y): {entrance_xy}")
+    print(f"Maze exits at positions (x, y): {exits_xy}")
+    print(f"Total (maze + hall) bounds xy: {np.array(total_bounds_xy).tolist()}")
+    print(f"Maze (only) bounds xy: {np.array(maze_bounds_xy).tolist()}")
+    print(f"Hall (only) bounds xy: {np.array(hall_bounds_xy).tolist()}")
+
+    # Set Bot's movement constraints
+    model_real = mujoco.MjModel.from_xml_path(bot_maze_real_xml)
+    data_real = mujoco.MjData(model_real)
+    mujoco.mj_forward(model_real, data_real)
+
+    x0, y0, _ = data_real.qpos[0:3]
+    qw, qx, qy, qz = data_real.qpos[3:7]
+    th0 = quat_to_yaw(qw, qx, qy, qz)
+    x_start = np.array([round(x0, 3), round(y0, 3), round(th0, 3)], dtype = float)
+    goal_choice = rng.randrange(len(exits_xy))
+    goal_exit_xy = exits_xy[goal_choice]
+    x_goal = np.array([round(goal_exit_xy[0], 3), round(goal_exit_xy[1], 3), 0.0], dtype = float)
+
+    print(f"\nSTART at {x_start} -> GOAL at {x_goal} (exit {goal_choice + 1})")
+
+    # ----------------------------------------
+    # EXPERIMENT WITH PARAMETERS VALUES
+    # ----------------------------------------
+    model_RRT = mujoco.MjModel.from_xml_path(bot_maze_RRT_xml)
+    rrt_path, rrt_nodes, rrt_parents = rrt_plan_se2(
+        model = model_RRT,
+        x_start = x_start,
+        x_goal = x_goal,
+        total_bounds_xy = total_bounds_xy,
+        maze_bounds_xy = maze_bounds_xy,
+        hall_bounds_xy = hall_bounds_xy,
+        step_size = robot_size,
+        goal_radius_xy = 0.1,
+        goal_radius_theta = 0.5,
+        max_iters = 30000,
+        w_theta = 0.2,
+        maze_sample_rate = 0.95,
+        goal_sample_rate = 0.05,
+        rng = np.random.default_rng(0),
+    )
+
+    if rrt_path is None:
+        print("RRT failed.")
+        plot_maze(horizontal, vertical, rows, cols, cell_size, x_translation, y_translation, z_rotation, rrt_path, False, rrt_nodes, rrt_parents)
+        return
+
+    print(f"RRT(SE2) success. Waypoints: {len(rrt_path)}")
+    print(f"Start: {rrt_path[0]} Found goal: {rrt_path[-1]} Original Goal: {x_goal}")
+    plot_maze(horizontal, vertical, rows, cols, cell_size, x_translation, y_translation, z_rotation, rrt_path, False, rrt_nodes, rrt_parents)
+
+    print("\nLaunching MuJoCo viewer ...")
+    with mujoco.viewer.launch_passive(model_real, data_real) as viewer:
+        follow_waypoints_se2(model_real, data_real, viewer, rrt_path)
+
+
+if __name__ == "__main__":
+    main()
