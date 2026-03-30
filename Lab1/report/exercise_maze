@@ -1,0 +1,474 @@
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import mujoco
+import mujoco.viewer
+import json
+
+
+# Maze Generation (Prim)
+
+def add_walls(rows, cols, r, c):
+    new_walls = []
+    if r > 0:
+        new_walls.append((r, c, "S"))
+    if r < rows - 1:
+        new_walls.append((r, c, "N"))
+    if c > 0:
+        new_walls.append((r, c, "W"))
+    if c < cols - 1:
+        new_walls.append((r, c, "E"))
+    return new_walls
+
+def generate_maze(rows, cols, exits_num, rng, PN = 0.25, PS = 0.25, PW = 0.25, PE = 0.25):
+    horizontal = np.ones((rows + 1, cols), dtype = bool)
+    vertical = np.ones((rows, cols + 1), dtype = bool)
+    visited = np.zeros((rows, cols), dtype = bool)
+    start_r = int(rows / 2)
+    start_c = int(cols / 2)
+    visited[start_r, start_c] = True
+    candidate_edges = []
+    candidate_edges += add_walls(rows, cols, start_r, start_c)
+    valid_weights = np.isclose(PN + PS + PW + PE, 1.0)
+    dir_weights = {"N": PN, "S": PS, "W": PW, "E": PE}  # Map directions to weights
+    
+    print(f"\nStarting from node: {(start_r, start_c)} -> marked as visited node")
+
+    # Run Prim's algorithm to create fully connected, acyclic, undirected maze
+    iterations = 0
+    while candidate_edges:
+        weights = [dir_weights[direction] for (_, _, direction) in candidate_edges]
+        sum_weights = sum(weights)
+        if valid_weights and not np.isclose(sum_weights, 0):  # if there are valid weights, choose favorable directions according to their weights
+            idx = rng.choices(range(len(candidate_edges)), weights = [w / sum_weights for w in weights], k = 1)[0]
+        else:  # if there are no valid weights, fallback to uniform distribution
+            idx = rng.randrange(len(candidate_edges))
+
+        r, c, direction = candidate_edges.pop(idx)
+        add_edge = False
+
+        if direction == "S":
+            nr, nc = r - 1, c
+            if not visited[nr, nc]:
+                add_edge = True
+                horizontal[r, c] = False
+                visited[nr, nc] = True
+                candidate_edges += add_walls(rows, cols, nr, nc)
+
+        elif direction == "N":
+            nr, nc = r + 1, c
+            if not visited[nr, nc]:
+                add_edge = True
+                horizontal[r + 1, c] = False
+                visited[nr, nc] = True
+                candidate_edges += add_walls(rows, cols, nr, nc)
+
+        elif direction == "W":
+            nr, nc = r, c - 1
+            if not visited[nr, nc]:
+                add_edge = True
+                vertical[r, c] = False
+                visited[nr, nc] = True
+                candidate_edges += add_walls(rows, cols, nr, nc)
+
+        elif direction == "E":
+            nr, nc = r, c + 1
+            if not visited[nr, nc]:
+                add_edge = True
+                vertical[r, c + 1] = False
+                visited[nr, nc] = True
+                candidate_edges += add_walls(rows, cols, nr, nc)
+        
+        if add_edge:
+            print(f"\nChoose wall / candidate edge: {r, c, direction} -> NOT VISITED NODE {(nr, nc)} ... CLEAR WALL & ADD EDGE !")
+        else:
+            print(f"\nChoose wall / candidate edge: {r, c, direction} -> already visited node {(nr, nc)}")
+        print(f"Currently visited nodes:\n {np.flipud(np.array(visited)).astype(int)}")
+        print(f"Remaining walls / candidate edges:\n {candidate_edges}")
+        iterations += 1
+
+    print(f"Total iterations of Prim's algorithm: {iterations}")
+
+    # Add Entrance and Exits
+    entrance_col = rng.randrange(cols)
+    horizontal[0, entrance_col] = False  # entrance
+    exits_cols = rng.sample(range(cols), exits_num)
+    for c in exits_cols:
+        horizontal[rows, c] = False  # exit
+
+    return horizontal, vertical
+
+def z_rotate(xi, yi, z_rotation):
+    cos_rot = np.cos(z_rotation)
+    sin_rot = np.sin(z_rotation)
+    return (cos_rot * xi - sin_rot * yi, sin_rot * xi + cos_rot * yi)
+
+def get_entrance_exits_xy(horizontal, rows, cols, cell_size, x_translation, y_translation, z_rotation):
+    entrances_xy = []
+    exits_xy = []
+    for c in range(cols):
+        if not horizontal[0, c]:
+            xf, yf = z_rotate((c + 0.5) * cell_size + x_translation, y_translation, z_rotation)
+            new_entrance = (round(float(xf), 3), round(float(yf), 3))
+            if new_entrance not in entrances_xy:
+                entrances_xy.append(new_entrance)
+        if not horizontal[rows, c]:
+            xf, yf = z_rotate((c + 0.5) * cell_size + x_translation, rows * cell_size + y_translation, z_rotation)
+            new_exit = (round(float(xf), 3), round(float(yf), 3))
+            if new_exit not in exits_xy:
+                exits_xy.append(new_exit)
+    return entrances_xy, exits_xy
+
+def get_bounds_xy(rows, cols, cell_size, x_translation, y_translation, z_rotation, hall_width):
+    # Define the hall (enclosing walls) bounds, maze bounds, and total bounds (hall + maze), along x and y axis
+    dx = x_translation
+    dy = y_translation
+    total_extremes_initial = [(dx, dy - hall_width), (cols * cell_size + dx, dy - hall_width), (dx, dy - hall_width), (dx, rows * cell_size + dy)]
+    total_extremes_rotated = [z_rotate(x, y, z_rotation) for x, y in total_extremes_initial]
+    xb_total, yb_total = [p[0] for p in total_extremes_rotated], [p[1] for p in total_extremes_rotated]
+    total_bounds_xy = [[round(min(xb_total), 3), round(max(xb_total), 3)], [round(min(yb_total), 3), round(max(yb_total), 3)]]  # total bounds along x and y axis
+    hall_extremes_initial = [(dx, dy - hall_width), (cols * cell_size + dx, dy - hall_width), (dx, dy - hall_width), (dx, dy)]
+    hall_extremes_rotated = [z_rotate(x, y, z_rotation) for x, y in hall_extremes_initial]
+    xb_hall, yb_hall = [p[0] for p in hall_extremes_rotated], [p[1] for p in hall_extremes_rotated]
+    hall_bounds_xy = [[round(min(xb_hall), 3), round(max(xb_hall), 3)], [round(min(yb_hall), 3), round(max(yb_hall), 3)]]  # hall bounds along x and y axis
+    maze_extremes_initial = [(dx, dy), (cols * cell_size + dx, dy), (dx, dy), (dx, rows * cell_size + dy)]
+    maze_extremes_rotated = [z_rotate(x, y, z_rotation) for x, y in maze_extremes_initial]
+    xb_maze, yb_maze = [p[0] for p in maze_extremes_rotated], [p[1] for p in maze_extremes_rotated]
+    maze_bounds_xy = [[round(min(xb_maze), 3), round(max(xb_maze), 3)], [round(min(yb_maze), 3), round(max(yb_maze), 3)]]  # maze bounds along x and y axis
+    return total_bounds_xy, maze_bounds_xy, hall_bounds_xy
+
+def get_cell_center(r, c, cell_size, x_translation, y_translation, z_rotation):
+    xf, yf = z_rotate(((c-1) + 0.5) * cell_size + x_translation, ((r-1) + 0.5) * cell_size + y_translation, z_rotation)
+    item_xy = (round(float(xf), 3), round(float(yf), 3))
+    return item_xy
+
+def get_all_cell_centers(rows, cols, cell_size, x_translation, y_translation, z_rotation):
+    all_centers = []
+    for r in range(rows):
+        for c in range(cols):
+            xf, yf = z_rotate(((c) + 0.5) * cell_size + x_translation, ((r) + 0.5) * cell_size + y_translation, z_rotation)
+            all_centers.append((round(float(xf), 3), round(float(yf), 3)))
+    
+    with open("cell_centers.json", "w") as f:
+        json.dump(all_centers, f, indent=4)
+    
+    return all_centers
+
+
+
+
+# Plot Maze (optionally the RRT solution also) with Matplotlib
+
+def plot_maze(horizontal, vertical, rows, cols, cell_size,
+              x_translation, y_translation, z_rotation,
+              rrt_path = None, show_orientation = False, rrt_nodes = None, rrt_parents = None, key_pos = None, door_pos = None):
+    fig, ax = plt.subplots()
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    dx = x_translation
+    dy = y_translation
+
+    # Draw horizontal walls
+    ax.plot([0, 0], [0, 0], 'k-', label="Walls")  # only for legend
+    for r in range(rows + 1):
+        for c in range(cols):
+            if horizontal[r, c]:
+                x0 = c * cell_size + dx
+                x1 = (c + 1) * cell_size + dx
+                y = r * cell_size + dy
+                x0r, y0r = z_rotate(x0, y, z_rotation)
+                x1r, y1r = z_rotate(x1, y, z_rotation)
+                ax.plot([x0r, x1r], [y0r, y1r], 'k-')
+
+    # Draw vertical walls
+    for r in range(rows):
+        for c in range(cols + 1):
+            if vertical[r, c]:
+                x = c * cell_size + dx
+                y0 = r * cell_size + dy
+                y1 = (r + 1) * cell_size + dy
+                x0r, y0r = z_rotate(x, y0, z_rotation)
+                x1r, y1r = z_rotate(x, y1, z_rotation)
+                ax.plot([x0r, x1r], [y0r, y1r], 'k')
+
+    # Plot all RRT nodes and RRT edges (tree structure)
+    if (rrt_nodes is not None and rrt_parents is not None and len(rrt_nodes) > 0):
+        rrt_nodes = np.asarray(rrt_nodes)
+        ax.plot([0, 0], [0, 0], 'g-', alpha=0.1, label="RRT Edges")  # only for legend
+        for i in range(len(rrt_nodes)):
+            parent = rrt_parents[i]
+            if parent == -1:
+                continue
+            x0, y0 = rrt_nodes[i, 0], rrt_nodes[i, 1]
+            x1, y1 = rrt_nodes[parent, 0], rrt_nodes[parent, 1]
+            ax.plot([x0, x1], [y0, y1], color='g', linewidth=0.5, alpha=0.1, zorder=1)
+        if rrt_nodes.ndim == 2 and rrt_nodes.shape[1] >= 2:
+            ax.scatter(rrt_nodes[:, 0], rrt_nodes[:, 1], s=10, c='g', alpha=0.2, label="RRT Nodes", zorder=2)
+    
+    # Plot RRT path on top
+    if rrt_path is not None and len(rrt_path) > 0:
+        rrt_path = np.asarray(rrt_path)
+        xs = rrt_path[:, 0]
+        ys = rrt_path[:, 1]
+        ax.plot(xs, ys, 'r-', linewidth=2, label="RRT Path", zorder=3)
+        ax.scatter(xs, ys, s=20, c='r', alpha=0.5, label="RRT Path Nodes", zorder=4)
+        ax.scatter(xs[0], ys[0], c='b', s=80, label="Start", zorder=5)
+        ax.scatter(xs[-1], ys[-1], c='g', s=80, label="Finish", zorder=5)
+        if show_orientation:
+            arrow_scale = 0.2
+            for x, y, th in rrt_path:
+                ddx = arrow_scale * np.cos(th)
+                ddy = arrow_scale * np.sin(th)
+                ax.arrow(x, y, ddx, ddy, head_width=0.05, head_length=0.05, fc='r', ec='r', alpha=0.6, zorder=6)
+
+    if key_pos is not None:
+        ax.scatter(key_pos[0], key_pos[1], c='yellow', s=150, edgecolors='black', label="Key", zorder=6)
+    if door_pos is not None:
+        # Use a square marker ('s') for the red door
+        ax.scatter(door_pos[0], door_pos[1], c='red', s=250, marker='s', edgecolors='black', label="Door", zorder=6)
+
+
+    ax.set_aspect("equal")
+    if rrt_path is not None and len(rrt_path) > 0:
+        ax.set_title("Dual Maze with RRT Path")
+    else:
+        ax.set_title("Dual Maze")
+    ax.legend(loc="upper left", bbox_to_anchor=(1, 1))
+    plt.tight_layout()
+    plt.show()
+
+
+# Export MuJoCo XMLs
+
+def export_data_to_mujoco_xmls(horizontal, vertical, rows, cols, x_translation, y_translation, z_rotation,
+                                cell_size, wall_thickness, wall_thickness_augm, wall_height, hall_width, rgba,
+                                dual_maze_real_xml, bots_dual_maze_real_xml,
+                                dual_maze_RRT_xml, bots_dual_maze_RRT_xml,
+                                key_pos, door_pos):
+    dx = x_translation
+    dy = y_translation
+    maze_points_WE = int(abs(2 * (z_rotation % (2 * np.pi)) / np.pi))
+    maze_x_size = cols * cell_size
+    maze_y_size = rows * cell_size
+    maze_max_size = max(maze_x_size, maze_y_size + dy)
+
+    def wall_sizes(is_horizontal, x_length, y_length):
+        if is_horizontal:
+            x_size = abs((maze_points_WE + 1) % 2 * x_length + maze_points_WE % 2 * y_length)
+            y_size = abs(maze_points_WE % 2 * x_length + (maze_points_WE + 1) % 2 * y_length)
+        else:
+            x_size = abs(maze_points_WE % 2 * y_length + (maze_points_WE + 1) % 2 * x_length)
+            y_size = abs((maze_points_WE + 1) % 2 * y_length + maze_points_WE % 2 * x_length)
+        return x_size, y_size
+
+    def write_walls(f, geom_id_name, thickness):
+        geom_id = 0
+
+        # Horizontal walls
+        for r in range(rows + 1):
+            for c in range(cols):
+                if horizontal[r, c]:
+                    xi = (c + 0.5) * cell_size + dx
+                    yi = r * cell_size + dy
+                    xf, yf = z_rotate(xi, yi, z_rotation)
+                    x_size, y_size = wall_sizes(True, (cell_size + thickness) / 2, thickness / 2)
+                    f.write(
+                        f'    <geom name="{geom_id_name}_{geom_id}" type="box" '
+                        f'pos="{xf:.3f} {yf:.3f} {(wall_height/2):.3f}" '
+                        f'size="{x_size:.3f} {y_size:.3f} {(wall_height/2):.3f}" '
+                        f'rgba="{rgba[0]} {rgba[1]} {rgba[2]} {rgba[3]}"/>\n'
+                    )
+                    geom_id += 1
+
+        # Vertical walls
+        for r in range(rows):
+            for c in range(cols + 1):
+                if vertical[r, c]:
+                    xi = c * cell_size + dx
+                    yi = (r + 0.5) * cell_size + dy
+                    xf, yf = z_rotate(xi, yi, z_rotation)
+                    x_size, y_size = wall_sizes(False, thickness / 2, (cell_size + thickness) / 2)
+                    f.write(
+                        f'    <geom name="{geom_id_name}_{geom_id}" type="box" '
+                        f'pos="{xf:.3f} {yf:.3f} {(wall_height/2):.3f}" '
+                        f'size="{x_size:.3f} {y_size:.3f} {(wall_height/2):.3f}" '
+                        f'rgba="{rgba[0]} {rgba[1]} {rgba[2]} {rgba[3]}"/>\n'
+                    )
+                    geom_id += 1
+
+    def write_enclosing_walls(f, geom_id_name, thickness):
+        # Rear wall extension
+        xi = dx + maze_x_size / 2
+        yi = dy - hall_width
+        xf, yf = z_rotate(xi, yi, z_rotation)
+        rear_x_size, rear_y_size = wall_sizes(True, (maze_x_size + thickness) / 2, thickness / 2)
+        f.write(
+            f'    <geom name="{geom_id_name}_rear_extension" type="box" '
+            f'pos="{xf:.3f} {yf:.3f} {(wall_height/2):.3f}" '
+            f'size="{rear_x_size:.3f} {rear_y_size:.3f} {(wall_height/2):.3f}" '
+            f'rgba="0.7 0.7 0.7 1.0"/>\n'
+        )
+
+        # Left & Right extensions
+        for i in range(2):
+            yi = dy - hall_width / 2
+            xf, yf = z_rotate([dx, dx + maze_x_size][i], yi, z_rotation)
+            x_size, y_size = wall_sizes(False, thickness / 2, (hall_width + thickness) / 2)
+            f.write(
+                f'    <geom name="{geom_id_name}_{["left", "right"][i]}_extension" type="box" '
+                f'pos="{xf:.3f} {yf:.3f} {(wall_height/2):.3f}" '
+                f'size="{x_size:.3f} {y_size:.3f} {(wall_height/2):.3f}" '
+                f'rgba="0.7 0.7 0.7 1.0"/>\n'
+            )
+
+    def write_maze_worldbody(f, thickness, use_material = False):
+        f.write('  <worldbody>\n')
+        f.write(f'    <geom name="yellow_key" type="sphere" pos="{key_pos[0]:.3f} {key_pos[1]:.3f} {key_pos[2]:.3f}" size="{round(cell_size/8, 3):.3f}" rgba="1 1 0 1" contype="0" conaffinity="0"/>\n')
+        f.write(f'    <geom name="red_door" type="box" pos="{door_pos[0]:.3f} {door_pos[1]:.3f} {door_pos[2]:.3f}" size="{round(cell_size/2, 3):.3f} {round(cell_size/2, 3):.3f} {round(wall_height/2, 3):.3f}" rgba="1 0 0 1" contype="0" conaffinity="0"/>\n')
+        light_zpos = max(rows, cols) * cell_size
+        for light_index in [(0, 0), (0, 1), (1, 0), (1, 1), (0.5, 0.5)]:
+            light_xpos, light_ypos = z_rotate(light_index[0] * cols * cell_size + dx, light_index[1] * rows * cell_size + dy, z_rotation)
+            f.write(f'    <light pos="{light_xpos:.3f} {light_ypos:.3f} {light_zpos:.3f}" dir="0 0 -1"/>\n')
+        if use_material:
+            f.write(f'    <geom name="floor" type="plane" size="{1.1*maze_max_size} {1.1*maze_max_size} 0.1" material="groundplane"/>\n')
+        else:
+            f.write(f'    <geom name="floor" type="plane" size="{1.1*maze_max_size} {1.1*maze_max_size} 0.1" rgba="0 1 1 1"/>\n')
+        write_walls(f, "maze_wall", thickness)
+        write_enclosing_walls(f, "maze_wall", thickness)
+        f.write('  </worldbody>\n')
+
+    def write_appearance_elements(f):
+        f.write('  <visual>\n')
+        f.write('    <headlight diffuse="0.5 0.5 0.5" ambient="0.3 0.3 0.3" specular="0 0 0"/>\n')
+        f.write('    <rgba haze="0.15 0.25 0.35 1"/>\n')
+        f.write('    <global azimuth="0" elevation="0"/>\n')
+        f.write('  </visual>\n\n')
+        f.write('  <asset>\n')
+        f.write('    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" '
+                'rgb2="0 0 0" width="512" height="3072"/>\n')
+        f.write('    <texture type="2d" name="groundplane" builtin="checker" mark="edge" '
+                'rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" '
+                'markrgb="0.8 0.8 0.8" width="500" height="500"/>\n')
+        f.write('    <material name="groundplane" texture="groundplane" '
+                'texuniform="true" texrepeat="5 5" reflectance="0.2"/>\n')
+        f.write('  </asset>\n')
+
+    def write_full_maze_xml(path, thickness, include_robot = False):
+        with open(path, "w") as f:
+            if include_robot:
+                f.write('<mujoco model="exercise_dual_scene">\n\n')
+                f.write('  <include file="explorer.xml"/>\n')
+                f.write('  <compiler angle="radian" meshdir="assets/"/>\n\n')
+                f.write('  <statistic center="0.3 0 0.4" extent="1"/>\n\n')
+            else:
+                f.write('<mujoco model="dual_maze">\n')
+            write_appearance_elements(f)
+            f.write('\n')
+            write_maze_worldbody(f, thickness, use_material = include_robot)
+            f.write('</mujoco>\n')
+        f.close()
+
+    # real xmls
+    write_full_maze_xml(dual_maze_real_xml, wall_thickness, False)
+    write_full_maze_xml(bots_dual_maze_real_xml, wall_thickness, True)
+
+    # RRT xmls
+    write_full_maze_xml(dual_maze_RRT_xml, wall_thickness_augm, False)
+    write_full_maze_xml(bots_dual_maze_RRT_xml, wall_thickness_augm, True)
+
+
+# Launch MuJoCo Viewer
+
+def view_mujoco_scene(xml_path):
+    model = mujoco.MjModel.from_xml_path(xml_path)
+    data = mujoco.MjData(model)
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        while viewer.is_running():
+            mujoco.mj_step(model, data)
+            viewer.sync()
+
+
+# Main
+
+def main():
+    
+    # dual maze parameters
+    robot_size = 0.3
+    wall_thickness = 0.05
+    walls_safety_margin = robot_size
+    added_size = max(0.0, min(2.0 * wall_thickness, walls_safety_margin / 2))
+    wall_thickness_augm = wall_thickness + added_size
+    cell_size = max(robot_size + 0.1, robot_size + walls_safety_margin) + wall_thickness
+    wall_height = 0.2
+    rgba = [0.7, 0.5, 0.7, 1.0]
+    horizontal_prob = 0.75
+    vertical_prob = 1.0 - horizontal_prob
+    rng_seed = 0
+    rng = random.Random(x = rng_seed)
+
+    rows = 10
+    cols_1 = 5
+    cols_2 = 10
+    exits_1 = 0
+    exits_2 = 0
+
+    x_translation_1 = -cols_1 * cell_size
+    x_translation_2 = 0.0
+    y_translation = wall_thickness / 2 + robot_size
+    z_rotation = -np.pi/2
+    hall_width = 2 * y_translation
+
+    # key and door positions
+    # key is located in maze 1
+    # door is located in maze 2
+    key_row = 8
+    key_col = 5
+    door_row = 5
+    door_col = 5
+    key_pos = get_cell_center(key_row, key_col, cell_size, x_translation_1, y_translation, z_rotation) + (round(wall_height / 2, 3),)
+    door_pos = get_cell_center(door_row, door_col, cell_size, x_translation_2, y_translation, z_rotation) + (round(wall_height / 2, 3),)
+
+    all_centers = get_all_cell_centers(rows, cols_1 + cols_2, cell_size, x_translation_1, y_translation, z_rotation)
+
+    dual_maze_real_xml = "exercise_scene_dual_maze_real.xml"
+    bots_dual_maze_real_xml = "exercise_scene_bots_dual_maze_real.xml"
+    dual_maze_RRT_xml = "exercise_scene_dual_maze_RRT.xml"
+    bots_dual_maze_RRT_xml = "exercise_scene_bots_dual_maze_RRT.xml"
+
+    horizontal_walls_1, vertical_walls_1 = generate_maze(rows, cols_1, exits_1, rng, PN = vertical_prob / 2, PS = vertical_prob / 2, PW = horizontal_prob / 2, PE = horizontal_prob / 2)
+    horizontal_walls_2, vertical_walls_2 = generate_maze(rows, cols_2, exits_2, rng, PN = vertical_prob / 2, PS = vertical_prob / 2, PW = horizontal_prob / 2, PE = horizontal_prob / 2)
+
+    entrance_xy_1, exits_xy_1 = get_entrance_exits_xy(horizontal_walls_1, rows, cols_1, cell_size, x_translation_1, y_translation, z_rotation)
+    entrance_xy_2, exits_xy_2 = get_entrance_exits_xy(horizontal_walls_2, rows, cols_2, cell_size, x_translation_2, y_translation, z_rotation)
+
+    total_bounds_xy_1, maze_bounds_xy_1, hall_bounds_xy_1 = get_bounds_xy(rows, cols_1, cell_size, x_translation_1, y_translation, z_rotation, hall_width)
+    total_bounds_xy_2, maze_bounds_xy_2, hall_bounds_xy_2 = get_bounds_xy(rows, cols_2, cell_size, x_translation_2, y_translation, z_rotation, hall_width)
+
+    horizontal_walls_total = np.block([horizontal_walls_1, horizontal_walls_2])
+    vertical_walls_total = np.block([vertical_walls_1, vertical_walls_2[:, 1:]])
+    cols_total = cols_1 + cols_2
+    plot_maze(horizontal_walls_total, vertical_walls_total, rows, cols_total, cell_size, x_translation_1, y_translation, z_rotation, None, False, None, None, key_pos, door_pos)
+
+    # exporting all xml files
+    export_data_to_mujoco_xmls(
+        horizontal_walls_total, vertical_walls_total, rows, cols_total, x_translation_1, y_translation, z_rotation,
+        cell_size, wall_thickness, wall_thickness_augm, wall_height, hall_width, rgba,
+        dual_maze_real_xml, bots_dual_maze_real_xml, dual_maze_RRT_xml, bots_dual_maze_RRT_xml,
+        key_pos, door_pos
+    )
+    print(f"\nGenerated mazes saved!")
+
+    print(f"\nHorizontal walls total:\n {np.flipud(np.array(horizontal_walls_total)).astype(int)}")
+    print(f"Vertical walls total:\n {np.flipud(np.array(vertical_walls_total)).astype(int)}")
+    print(f"Maze entrances at positions (x, y): {entrance_xy_1} (maze 1), and {entrance_xy_2} (maze 2)")
+    print(f"Maze exits at positions (x, y): {exits_xy_1} (maze 1), and {exits_xy_2} (maze 2)")
+
+    print("\nLaunching MuJoCo viewer ...")
+    view_mujoco_scene(dual_maze_real_xml)
+    #view_mujoco_scene(bots_dual_maze_real_xml)
+    #view_mujoco_scene(dual_maze_RRT_xml)
+    #view_mujoco_scene(bots_dual_maze_RRT_xml)
+
+if __name__ == "__main__":
+    main()
