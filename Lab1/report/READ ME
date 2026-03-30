@@ -1,0 +1,28 @@
+RRT Exploration with Key-Door Mechanism
+
+We consider an explorer robot that starts from an initial position and aims to cover as much of the maze as possible using the RRT (Rapidly-exploring Random Tree) algorithm.
+
+Problem Description
+The robot's exploration is initially blocked by a door (represented as a red cube).
+The door can only be opened if the robot reaches a key (represented as a yellow sphere).
+Once the robot reaches the key, the door opens, allowing access to previously unreachable areas of the maze.
+Assumptions
+The robot is allowed to sample configurations across the entire maze.
+If the connect function attempts to extend the tree toward a region behind the closed door, it fails and returns False.
+After the door is opened, the connect function operates normally without restrictions.
+Both the door and the key are non-physical (non-colliding) objects; they serve only as visual markers in the environment.
+Objective
+
+Modify and extend the provided lab code to implement the above scenario and maximize the area coverage of the maze using RRT.
+
+Coverage Metric
+The maze is divided into cells.
+A cell is considered visited if there exists at least one node of the RRT tree within a radius of 0.1 meters from the center of that cell.
+Report the percentage of the maze covered by the RRT.
+Simulation Task (MuJoCo)
+
+Using the provided controller, simulate the following trajectory in MuJoCo:
+
+Start position →
+Key location →
+A target point that was not accessible before the door was opened
