@@ -25,16 +25,9 @@ SENSOR_DIRS = {"front": 0.0, "left": 90.0, "back": 180.0, "right": -90.0}  # μ�
 class GridMap:
     def __init__(self, center=(0.0, 0.0), size=10.0, res=0.05,
                  max_range=3.0, no_hit_range=1.5, visit_radius=0.30,
-                 sensor_offset=0.03, cone_deg=6.0,
+                 sensor_offset=0.03, cone_deg=9.0, cone_rays=5,
                  l_occ=0.9, l_free=-0.4, l_min=-4.0, l_max=4.0,
                  occ_thr=0.6, free_thr=-0.3):
-        """
-        Ρυθμίσεις χάρτη (στυλ "γεμάτοι τοίχοι"):
-          max_range=3.0 : μετρήσεις έως 3 m σημειώνονται ως εμπόδια,
-          occ_thr=0.6   : ένα κελί γίνεται εμπόδιο από την ΠΡΩΤΗ μέτρηση (0.9 > 0.6),
-          l_free=-0.4   : χρειάζονται ~3 μετρήσεις "ελεύθερο" για να σβηστεί ένα εμπόδιο.
-        (Για λιγότερο θόρυβο αλλά πιο αραιούς τοίχους: occ_thr=1.0, max_range=2.5.)
-        """
         self.res = res
         self.n = int(round(size / res))
         self.origin = np.array([center[0] - size / 2, center[1] - size / 2])
@@ -43,7 +36,7 @@ class GridMap:
         self.version = 0          # αυξάνεται σε κάθε ενημέρωση (για cache)
         self.max_range, self.no_hit_range = max_range, no_hit_range
         self.sensor_offset = sensor_offset
-        self.cone = np.radians(np.linspace(-cone_deg, cone_deg, 3))
+        self.cone = np.radians(np.linspace(-cone_deg, cone_deg, cone_rays))
         self.l_occ, self.l_free, self.l_min, self.l_max = l_occ, l_free, l_min, l_max
         self.occ_thr, self.free_thr = occ_thr, free_thr
         r = int(math.ceil(visit_radius / res))
@@ -95,9 +88,17 @@ class GridMap:
                 free_i.append(ci)
                 free_j.append(cj)
             if hit:
-                i, j = self.world_to_grid(sx + r * math.cos(a0), sy + r * math.sin(a0))
-                if self.in_bounds(i, j):
-                    occ.append((i, j))
+                # Πριν: μόνο η κεντρική ακτίνα (da=0) σημείωνε "κατειλημμένο" κελί.
+                # Ο αισθητήρας όμως έχει πλάτος δέσμης (~27 μοίρες) -- η επιφάνεια
+                # που ανίχνευσε γεμίζει όλο αυτό το πλάτος, όχι μόνο ένα σημείο στο
+                # κέντρο. Σημειώνουμε το τέλος ΚΑΘΕ ακτίνας του κώνου ως κατειλημμένο
+                # (όχι μόνο του κέντρου), ώστε ο τοίχος/εμπόδιο να βγαίνει ως συνεχής
+                # επιφάνεια στον χάρτη αντί για μεμονωμένα σημεία.
+                for da in self.cone:
+                    a = a0 + da
+                    i, j = self.world_to_grid(sx + r * math.cos(a), sy + r * math.sin(a))
+                    if self.in_bounds(i, j):
+                        occ.append((i, j))
         if free_i:
             self.logodds[np.concatenate(free_i), np.concatenate(free_j)] += self.l_free
         for i, j in occ:
